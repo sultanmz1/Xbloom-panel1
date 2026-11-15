@@ -10,7 +10,9 @@
 #include <lvgl.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "ble_link.h"
 #include "cloud.h"
@@ -57,6 +59,21 @@ int unit = 0;  // scale: 0 g, 1 oz, 2 ml
 bool sw_running = false;
 uint32_t sw_start = 0, sw_elapsed = 0;
 
+// Persistent automatic brew schedule. The main loop keeps running while the
+// backlight is dimmed/off, so scheduled starts do not depend on the screen.
+struct BrewSchedule {
+  bool enabled = false;
+  bool daily = true;
+  uint32_t uid = 0;
+  int hour = 7, minute = 0;
+  int64_t once_epoch = 0;
+  int last_day = -1;
+} brew_schedule;
+uint32_t last_weight_ms = 0;
+bool scheduled_loading = false;
+uint32_t scheduled_uid = 0;
+uint32_t schedule_last_check_ms = 0;
+
 // screens
 lv_obj_t *scr_home, *scr_detail, *scr_grinder, *scr_brewer, *scr_scale;
 lv_obj_t *page_home, *page_recipes, *page_settings, *tab_lbl[3];
@@ -76,17 +93,158 @@ lv_obj_t *sc_value, *sc_unit, *sc_timer, *sc_play_icon;
 lv_obj_t *pat_btn[3], *unit_btn[3];
 lv_obj_t *toast, *toast_lbl;
 lv_timer_t *toast_timer;
+lv_obj_t *sched_modal, *sched_mode_dd, *sched_hour, *sched_minute;
+lv_obj_t *sched_day, *sched_month, *sched_year, *sched_date_group;
 
 // ============================================================================
 // small helpers
 // ============================================================================
-// Only touch LVGL when something really changes: every change makes the panel
-// redraw that area, and redraws compete with the display for PSRAM bandwidth
-// (redrawing the clock and status bar 5x a second caused the line glitches).
+// Arabic UI strings. Keep this table centralized so dynamic labels, buttons,
+// toasts and status text all use the same translation path.
+struct UiTranslation { const char *en; const char *ar; };
+static const UiTranslation UI_TRANSLATIONS[] = {
+  {"Not connected", "غير متصل"}, {"Not signed in", "لم يتم تسجيل الدخول"},
+  {"Delete", "حذف"}, {"Show", "إظهار"}, {"Hide", "إخفاء"}, {"RPM", "دورة/دقيقة"},
+  {"Not connected to the xBloom", "غير متصل بجهاز xBloom"}, {"Centered", "في الوسط"},
+  {"Circular", "دائري"}, {"Spiral", "حلزوني"}, {"Sign in", "تسجيل الدخول"},
+  {"Connecting", "جارٍ الاتصال"}, {"Scale", "الميزان"}, {"Settings", "الإعدادات"},
+  {"Wi-Fi", "واي فاي"}, {"Software update", "تحديث البرنامج"}, {"xBloom account", "حساب xBloom"},
+  {"Recipes", "الوصفات"}, {"Sync now", "مزامنة الآن"}, {"Syncing...", "جارٍ المزامنة..."},
+  {"Connecting...", "جارٍ الاتصال..."}, {"Scan again", "إعادة البحث"}, {"Join", "اتصال"},
+  {"Password", "كلمة المرور"}, {"Cancel", "إلغاء"}, {"No favorites yet", "لا توجد وصفات مفضلة بعد"},
+  {"Grinder", "المطحنة"}, {"Brewer", "آلة التحضير"}, {"Favorite Recipes", "الوصفات المفضلة"},
+  {"Not saved to account", "غير محفوظة في الحساب"},
+  {"Recipes saved from share links appear here.", "الوصفات المحفوظة من روابط المشاركة تظهر هنا."},
+  {"Sign in under Settings to bring in your recipes.", "سجّل الدخول من الإعدادات لاستيراد وصفاتك."},
+  {"My Recipes", "وصفاتي"}, {"+  New", "+  جديد"}, {"Created", "أنشأتها"}, {"Shared", "مشتركة"},
+  {"Starter", "أساسية"}, {"CONNECTION", "الاتصال"}, {"SCREEN", "الشاشة"},
+  {"Clock when idle", "عرض الساعة عند الخمول"}, {"Sleep after", "إطفاء الشاشة بعد"},
+  {"1 min\n3 min\n5 min\n10 min\nNever", "دقيقة\n3 دقائق\n5 دقائق\n10 دقائق\nأبدًا"},
+  {"Clock colour", "لون الساعة"}, {"White\nBlue\nBrown", "أبيض\nأزرق\nبني"},
+  {"Off at night (11 PM-6 AM)", "إيقاف ليلًا (11 مساءً–6 صباحًا)"}, {"ABOUT", "حول"},
+  {"Machine", "الجهاز"}, {"Synced %s", "تمت المزامنة %s"}, {"Looking for networks...", "جارٍ البحث عن الشبكات..."},
+  {"No networks found", "لم يتم العثور على شبكات"}, {"Secured", "محمية"}, {"Open", "مفتوحة"},
+  {"Choose your network from the list.", "اختر شبكتك من القائمة."}, {"Connected\n%s", "متصل\n%s"},
+  {"Wrong password. Tap the network to try again.", "كلمة المرور غير صحيحة. اضغط على الشبكة للمحاولة مجددًا."},
+  {"Network not found. Is it in range?", "لم يتم العثور على الشبكة. هل هي ضمن النطاق؟"},
+  {"Forget network", "نسيان الشبكة"}, {"Join \"%s\"", "الاتصال بـ \"%s\""},
+  {"Connect the panel to Wi-Fi first.", "صِل الشاشة بشبكة واي فاي أولًا."},
+  {"On your phone or computer (same Wi-Fi), open:", "افتح على هاتفك أو الكمبيوتر (على شبكة واي فاي نفسها):"},
+  {"or  http://%s     then choose the update file.", "أو http://%s ثم اختر ملف التحديث."},
+  {"Waiting for the file...", "بانتظار الملف..."},
+  {"Installing... %d%%   Keep the panel powered.", "جارٍ التثبيت... %d%% أبقِ الشاشة متصلة بالطاقة."},
+  {"Installed. Restarting...", "تم التثبيت. جارٍ إعادة التشغيل..."}, {"Failed: %s", "فشل: %s"},
+  {"Installed version %s", "الإصدار المثبت %s"}, {"Wi-Fi settings", "إعدادات واي فاي"},
+  {"If an update ever fails to start, the panel goes back to this version by itself.", "إذا تعذّر بدء التحديث، ستعود الشاشة تلقائيًا إلى هذا الإصدار."},
+  {"Off", "إيقاف"}, {"Wrong Wi-Fi password", "كلمة مرور واي فاي غير صحيحة"},
+  {"Scanning...", "جارٍ البحث..."}, {"Place your cup", "ضع كوبك"},
+  {"The recipe is loaded on the machine.\nPut your cup on the scale, then start.", "الوصفة محمّلة على المكينة.\nضع كوبك على الميزان ثم ابدأ."},
+  {"Brew", "ابدأ التحضير"}, {"Choose a recipe first", "اختر وصفة أولًا"},
+  {"Choose a valid future date and time", "اختر تاريخًا ووقتًا صحيحين في المستقبل"},
+  {"Daily brew schedule saved", "تم حفظ الجدولة اليومية"}, {"One-time brew schedule saved", "تم حفظ الموعد لمرة واحدة"},
+  {"Brew schedule cancelled", "تم إلغاء الجدولة"}, {"A scheduled brew is already starting", "يجري بدء تحضير مجدول بالفعل"},
+  {"Schedule brew", "جدولة التحضير"}, {"Repeat", "التكرار"}, {"Daily\nOnce", "يوميًا\nمرة واحدة"},
+  {"Time (24-hour)", "الوقت (24 ساعة)"}, {"Date", "التاريخ"},
+  {"Jan\nFeb\nMar\nApr\nMay\nJun\nJul\nAug\nSep\nOct\nNov\nDec", "يناير\nفبراير\nمارس\nأبريل\nمايو\nيونيو\nيوليو\nأغسطس\nسبتمبر\nأكتوبر\nنوفمبر\nديسمبر"},
+  {"Cancel schedule", "إلغاء الجدولة"}, {"Close", "إغلاق"}, {"Save schedule", "حفظ الجدولة"},
+  {"One-time schedule expired; no brew was started", "انتهت صلاحية الموعد ولم يبدأ التحضير"},
+  {"POURS", "الصبّات"}, {"Pours", "الصبّات"}, {"Bloom", "التفتح"},
+  {"Grind Size", "درجة الطحن"}, {"Dose", "جرعة البن"}, {"Grind size", "درجة الطحن"},
+  {"Volume", "كمية الماء"}, {"Temperature", "درجة الحرارة"}, {"Flow rate", "معدل التدفق"},
+  {"Water", "الماء"}, {"Time", "الوقت"}, {"LOADING", "جارٍ التحميل"}, {"READY", "جاهز"},
+  {"STARTING", "جارٍ البدء"}, {"PAUSE", "إيقاف مؤقت"}, {"RESUME", "استئناف"}, {"BUSY", "مشغول"},
+  {"Another recipe is on the machine", "توجد وصفة أخرى محمّلة على المكينة"},
+  {"Espresso", "إسبريسو"}, {"Moka Pot", "موكا"}, {"AeroPress", "إيروبرس"},
+  {"Pourover\nCoffee Maker", "قهوة الترشيح"}, {"French Press", "فرنش برس"}, {"Cold Brew", "قهوة باردة"},
+  {"Level", "المستوى"}, {"Grinder Speed", "سرعة المطحنة"},
+  {"Saved on the panel. Sign in to save it to your account too.", "حُفظت على الشاشة. سجّل الدخول لحفظها في حسابك أيضًا."},
+  {"Save", "حفظ"}, {"It will be removed from the panel.", "ستُحذف من الشاشة."},
+  {"Recipe name", "اسم الوصفة"}, {"Name", "الاسم"}, {"Done", "تم"}, {"Other", "أخرى"}, {"Tea", "شاي"},
+  {"Wait after", "انتظار بعد"}, {"Agitate before", "تحريك قبل"}, {"Agitate after", "تحريك بعد"},
+  {"Remove this pour", "حذف هذه الصبّة"}, {"not yet", "ليس بعد"}, {"AM", "ص"}, {"PM", "م"},
+  {"Sign in with your xBloom app email and password to bring your recipes to the panel. ", "سجّل الدخول ببريد تطبيق xBloom وكلمة المرور لإحضار وصفاتك إلى الشاشة."},
+  {"Edits sync both ways.", "تتم مزامنة التعديلات في الاتجاهين."},
+  {"Connect to Wi-Fi first (Settings > Wi-Fi)", "اتصل بواي فاي أولًا (الإعدادات > واي فاي)"},
+  {"Email", "البريد الإلكتروني"}, {"Next", "التالي"}, {"xBloom password", "كلمة مرور xBloom"},
+  {"Sign out?", "تسجيل الخروج؟"},
+  {"Your account's recipes will be removed from the panel. Recipes made on the panel stay.", "ستُزال وصفات حسابك من الشاشة، وستبقى الوصفات التي أنشأتها عليها."},
+  {"The panel saves your password so it can sign in again by itself.", "تحفظ الشاشة كلمة المرور لتسجيل الدخول تلقائيًا."},
+  {"Saved on the panel, but not to your account: %s", "حُفظت على الشاشة، لكن لم تُحفظ في حسابك: %s"},
+  {"Couldn't delete it from your account: %s", "تعذّر حذفها من حسابك: %s"},
+  {"Connected", "متصل"}, {"Searching", "جارٍ البحث"}, {"Starting", "جارٍ البدء"},
+  {"Your coffee", "قهوتك"}, {"Command failed", "فشل تنفيذ الأمر"},
+  {"Scheduled brew cancelled: no cup detected", "أُلغي التحضير المجدول: لم يتم اكتشاف كوب"},
+  {"Home Wi-Fi", "واي فاي المنزل"},
+  {"Bluetooth write failed", "فشل إرسال أمر عبر Bluetooth"},
+  {"No reply from machine", "لا يوجد رد من المكينة"},
+  {"Machine is asleep", "المكينة في وضع السكون"},
+  {"1-9 pours required", "يجب أن يكون عدد الصبّات من 1 إلى 9"},
+  {"bad cup type", "نوع الكوب غير صالح"},
+  {"dose out of range for cup", "جرعة البن خارج النطاق المناسب للكوب"},
+  {"grind size must be 1-80", "درجة الطحن يجب أن تكون بين 1 و80"},
+  {"grinder rpm must be 60-120", "سرعة المطحنة يجب أن تكون بين 60 و120 دورة/دقيقة"},
+  {"pour volume must be 0-240 ml", "كمية الصب يجب أن تكون بين 0 و240 مل"},
+  {"temperature must be 20-98 C", "درجة الحرارة يجب أن تكون بين 20 و98 مئوية"},
+  {"flow must be 3.0-3.5", "معدل التدفق يجب أن يكون بين 3.0 و3.5"},
+  {"pause must be 0-59 s", "مدة التوقف يجب أن تكون بين 0 و59 ثانية"},
+  {"bad pattern", "نمط الصب غير صالح"}, {"no water", "لا يوجد ماء"},
+  {"No water", "لا يوجد ماء"}, {"Go to the home screen and retry", "ارجع إلى الشاشة الرئيسية وحاول مجددًا"},
+  {"Machine not ready", "المكينة غير جاهزة"}, {"Power-cycle restore incomplete", "لم تكتمل استعادة التشغيل"},
+  {"Recipe rejected", "تم رفض الوصفة"}, {"Machine busy", "المكينة مشغولة"},
+  {"Wrong email or password", "البريد الإلكتروني أو كلمة المرور غير صحيحة"},
+  {"No Wi-Fi", "لا يوجد اتصال واي فاي"}, {"Connect to Wi-Fi first", "اتصل بشبكة واي فاي أولًا"},
+  {"Connect Wi-Fi first to set the correct time", "اتصل بشبكة واي فاي لضبط الوقت الصحيح"},
+  {"START", "ابدأ"}, {"Untitled", "بدون عنوان"}, {"Edit recipe", "تعديل الوصفة"},
+  {"Delete recipe?", "حذف الوصفة؟"},
+  {"It will also be deleted from your xBloom account.", "سيتم حذفها أيضًا من حساب xBloom."},
+  {"New recipe", "وصفة جديدة"}, {"Signing in...", "جارٍ تسجيل الدخول..."}, {"Sign out", "تسجيل الخروج"}
+};
+
+const char *tr(const char *s) {
+  if (!s) return s;
+  for (const auto &entry : UI_TRANSLATIONS) if (strcmp(s, entry.en) == 0) return entry.ar;
+  return s;
+}
+
+bool has_arabic(const char *s) {
+  if (!s) return false;
+  const unsigned char *p = (const unsigned char *)s;
+  while (*p) {
+    if (p[0] == 0xD8 || p[0] == 0xD9 || p[0] == 0xDB || p[0] == 0xDC || p[0] == 0xEF) return true;
+    ++p;
+  }
+  return false;
+}
+
+struct LabelTextState {
+  char *last_text = nullptr;
+  const lv_font_t *base_font = nullptr;
+  bool arabic_active = false;
+};
+
+// Only touch LVGL when the unprocessed source text really changes. LVGL's
+// Arabic processor returns shaped text from lv_label_get_text(), so comparing
+// against that value would cause repeated redraws. Cache the source string.
 void set_text(lv_obj_t *l, const char *t) {
-  const char *cur = lv_label_get_text(l);
-  if (cur && t && strcmp(cur, t) == 0) return;
+  if (!l || !t) return;
+  t = tr(t);
+  LabelTextState *state = (LabelTextState *)lv_obj_get_user_data(l);
+  if (state && state->last_text && strcmp(state->last_text, t) == 0) return;
+  if (state) {
+    free(state->last_text);
+    state->last_text = strdup(t);
+  }
   lv_label_set_text(l, t);
+  if (has_arabic(t)) {
+    if (state) state->arabic_active = true;
+    lv_obj_set_style_text_font(l, &lv_font_dejavu_16_persian_hebrew, 0);
+    lv_obj_set_style_base_dir(l, LV_BASE_DIR_RTL, 0);
+    lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_RIGHT, 0);
+  } else if (state && state->arabic_active) {
+    state->arabic_active = false;
+    if (state->base_font) lv_obj_set_style_text_font(l, state->base_font, 0);
+    lv_obj_set_style_base_dir(l, LV_BASE_DIR_AUTO, 0);
+  }
 }
 void set_text_color(lv_obj_t *o, lv_color_t c, lv_style_selector_t sel) {
   if (sel == 0 && lv_color_eq(lv_obj_get_style_text_color(o, LV_PART_MAIN), c)) return;
@@ -113,6 +271,11 @@ void open_editor(uint32_t uid);
 void open_account(lv_event_t * = nullptr);
 void toggle_favorite(uint32_t uid);
 lv_obj_t *st_acc_val;
+void build_schedule_modal();
+void open_schedule(lv_event_t * = nullptr);
+void tick_schedule();
+void load_schedule();
+void save_schedule();
 
 // Plain rectangle. Not clickable unless on_click() is called on it, so
 // decorations never swallow a tap meant for the card underneath.
@@ -142,8 +305,16 @@ lv_obj_t *group(lv_obj_t *parent, int x, int y, int w, int h) {
 
 lv_obj_t *text(lv_obj_t *parent, const char *t, const lv_font_t *f, lv_color_t c) {
   lv_obj_t *l = lv_label_create(parent);
-  set_text(l, t);
+  LabelTextState *state = new LabelTextState();
+  state->base_font = f;
+  lv_obj_set_user_data(l, state);
+  lv_obj_add_event_cb(l, [](lv_event_t *e) {
+    lv_obj_t *obj = (lv_obj_t *)lv_event_get_target(e);
+    LabelTextState *data = (LabelTextState *)lv_obj_get_user_data(obj);
+    if (data) { free(data->last_text); delete data; lv_obj_set_user_data(obj, nullptr); }
+  }, LV_EVENT_DELETE, nullptr);
   lv_obj_set_style_text_font(l, f, 0);
+  set_text(l, t);
   set_text_color(l, c, 0);
   return l;
 }
@@ -707,7 +878,7 @@ lv_obj_t *toggle(lv_obj_t *row_obj, bool on, lv_event_cb_t cb) {
 // A compact dark drop-down list on the right of a settings row.
 lv_obj_t *dropdown(lv_obj_t *row_obj, const char *options, lv_event_cb_t cb) {
   lv_obj_t *d = lv_dropdown_create(row_obj);
-  lv_dropdown_set_options_static(d, options);
+  lv_dropdown_set_options(d, tr(options));
   lv_obj_set_size(d, 140, 38);
   lv_obj_align(d, LV_ALIGN_RIGHT_MID, -12, 0);
   lv_obj_set_style_bg_color(d, hex(0x2C2C2E), 0);
@@ -715,7 +886,8 @@ lv_obj_t *dropdown(lv_obj_t *row_obj, const char *options, lv_event_cb_t cb) {
   lv_obj_set_style_border_width(d, 0, 0);
   lv_obj_set_style_radius(d, 10, 0);
   lv_obj_set_style_text_color(d, hex(TEXT), 0);
-  lv_obj_set_style_text_font(d, &inter_16, 0);
+  lv_obj_set_style_text_font(d, has_arabic(tr(options)) ? &lv_font_dejavu_16_persian_hebrew : &inter_16, 0);
+  if (has_arabic(tr(options))) lv_obj_set_style_base_dir(d, LV_BASE_DIR_RTL, 0);
   lv_obj_set_style_pad_hor(d, 12, 0);
   lv_obj_set_style_pad_ver(d, 9, 0);
   lv_obj_set_style_text_font(d, &lv_font_montserrat_14, LV_PART_INDICATOR);  // the arrow is an icon glyph
@@ -725,7 +897,8 @@ lv_obj_t *dropdown(lv_obj_t *row_obj, const char *options, lv_event_cb_t cb) {
   lv_obj_set_style_border_width(l, 0, 0);
   lv_obj_set_style_radius(l, 12, 0);
   lv_obj_set_style_text_color(l, hex(TEXT), 0);
-  lv_obj_set_style_text_font(l, &inter_20, 0);
+  lv_obj_set_style_text_font(l, has_arabic(tr(options)) ? &lv_font_dejavu_16_persian_hebrew : &inter_20, 0);
+  if (has_arabic(tr(options))) lv_obj_set_style_base_dir(l, LV_BASE_DIR_RTL, 0);
   lv_obj_set_style_text_line_space(l, 18, 0);
   lv_obj_set_style_pad_all(l, 10, 0);
   lv_obj_set_style_max_height(l, 300, 0);
@@ -822,7 +995,7 @@ void refresh_sync_row() {
   localtime_r(&ls, &t);
   char hm[12], b[24];
   format_clock(t, hm, sizeof hm);
-  snprintf(b, sizeof b, "Synced %s", hm);
+  snprintf(b, sizeof b, "تمت المزامنة %s", hm);
   set_text(st_sync_val, b);
 }
 
@@ -877,7 +1050,7 @@ void refresh_wifi_status() {
   switch (net::state()) {
     case net::Wifi::Connected:
       title = net::ssid();
-      snprintf(buf, sizeof buf, "Connected\n%s", net::ip());
+      snprintf(buf, sizeof buf, "متصل\n%s", net::ip());
       sub = buf;
       break;
     case net::Wifi::Connecting:
@@ -1014,7 +1187,7 @@ void open_text_entry(const char *title, const char *initial, const char *placeho
 void open_password(const char *ssid) {
   strlcpy(pw_ssid, ssid, sizeof pw_ssid);
   char buf[64];
-  snprintf(buf, sizeof buf, "Join \"%s\"", ssid);
+  snprintf(buf, sizeof buf, "الاتصال بـ \"%s\"", ssid);
   open_text_entry(buf, "", "Password", true, "Join", scr_wifi, [](const char *t) {
     net::join(pw_ssid, t);
     refresh_wifi_status();
@@ -1035,7 +1208,7 @@ void refresh_update() {
     set_text(up_steps, "On your phone or computer (same Wi-Fi), open:");
     snprintf(buf, sizeof buf, "http://%s", net::hostname());
     set_text(up_url, buf);
-    snprintf(buf, sizeof buf, "or  http://%s     then choose the update file.", net::ip());
+    snprintf(buf, sizeof buf, "أو http://%s ثم اختر ملف التحديث.", net::ip());
     set_text(up_ip, buf);
   }
   const net::Upd u = net::update_state();
@@ -1044,12 +1217,12 @@ void refresh_update() {
   switch (u) {
     case net::Upd::Idle: set_text(up_status, online ? "Waiting for the file..." : ""); break;
     case net::Upd::Receiving:
-      snprintf(buf, sizeof buf, "Installing... %d%%   Keep the panel powered.", net::update_progress());
+      snprintf(buf, sizeof buf, "جارٍ التثبيت... %d%% أبقِ الشاشة متصلة بالطاقة.", net::update_progress());
       set_text(up_status, buf);
       break;
     case net::Upd::Done: set_text(up_status, "Installed. Restarting..."); break;
     case net::Upd::Failed:
-      snprintf(buf, sizeof buf, "Failed: %s", net::update_error());
+      snprintf(buf, sizeof buf, "فشل: %s", net::update_error());
       set_text(up_status, buf);
       break;
   }
@@ -1066,7 +1239,7 @@ void build_update() {
   });
   lv_obj_t *card = box(scr_update, M, 96, W - 2 * M, H - M - 96, 0x1C1C1E, R_SM);
   char buf[48];
-  snprintf(buf, sizeof buf, "Installed version %s", FW_VERSION);
+  snprintf(buf, sizeof buf, "الإصدار المثبت %s", FW_VERSION);
   lv_obj_t *v = text(card, buf, &inter_20b, hex(TEXT));
   lv_obj_set_pos(v, 24, 22);
   up_steps = text(card, "", &inter_20, hex(SUB));
@@ -1226,6 +1399,256 @@ void build_modal() {
   show(modal, false);
 }
 
+// ============================================================================
+// AUTOMATIC BREW SCHEDULER
+// ============================================================================
+const char *SCHEDULE_FILE = "/brew_schedule.json";
+
+int schedule_day_key(const struct tm &t) { return t.tm_year * 1000 + t.tm_yday; }
+
+void save_schedule() {
+  char json[192];
+  snprintf(json, sizeof(json),
+           "{\"enabled\":%d,\"daily\":%d,\"uid\":%lu,\"hour\":%d,\"minute\":%d,\"epoch\":%lld,\"last\":%d}",
+           brew_schedule.enabled ? 1 : 0, brew_schedule.daily ? 1 : 0,
+           (unsigned long)brew_schedule.uid, brew_schedule.hour, brew_schedule.minute,
+           (long long)brew_schedule.once_epoch, brew_schedule.last_day);
+  storage::write(SCHEDULE_FILE, std::string(json));
+}
+
+void load_schedule() {
+  std::string json;
+  if (!storage::read(SCHEDULE_FILE, json)) return;
+  int enabled = 0, daily = 1, hour = 7, minute = 0, last = -1;
+  unsigned long uid = 0;
+  long long epoch = 0;
+  int n = sscanf(json.c_str(), "{\"enabled\":%d,\"daily\":%d,\"uid\":%lu,\"hour\":%d,\"minute\":%d,\"epoch\":%lld,\"last\":%d}",
+                 &enabled, &daily, &uid, &hour, &minute, &epoch, &last);
+  if (n != 7 || hour < 0 || hour > 23 || minute < 0 || minute > 59) return;
+  brew_schedule.enabled = enabled != 0;
+  brew_schedule.daily = daily != 0;
+  brew_schedule.uid = (uint32_t)uid;
+  brew_schedule.hour = hour;
+  brew_schedule.minute = minute;
+  brew_schedule.once_epoch = epoch;
+  brew_schedule.last_day = last;
+}
+
+lv_obj_t *schedule_roller(lv_obj_t *parent, int x, int y, int w, int h,
+                          const char *opts, int selected) {
+  lv_obj_t *r = lv_roller_create(parent);
+  lv_roller_set_options(r, opts, LV_ROLLER_MODE_NORMAL);
+  lv_roller_set_visible_row_count(r, 3);
+  lv_roller_set_selected(r, selected, LV_ANIM_OFF);
+  lv_obj_set_size(r, w, h);
+  lv_obj_set_pos(r, x, y);
+  lv_obj_set_style_bg_color(r, hex(0x2C2C2E), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(r, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_text_color(r, hex(TEXT), LV_PART_MAIN);
+  lv_obj_set_style_text_font(r, &lv_font_dejavu_16_persian_hebrew, LV_PART_MAIN);
+  lv_obj_set_style_base_dir(r, LV_BASE_DIR_RTL, 0);
+  lv_obj_set_style_bg_color(r, hex(0x48484A), LV_PART_SELECTED);
+  lv_obj_set_style_text_color(r, hex(TEXT), LV_PART_SELECTED);
+  lv_obj_set_style_text_font(r, &lv_font_dejavu_16_persian_hebrew, LV_PART_SELECTED);
+  lv_obj_set_style_border_width(r, 0, LV_PART_MAIN);
+  lv_obj_set_style_radius(r, 10, LV_PART_MAIN);
+  return r;
+}
+
+void refresh_schedule_mode() {
+  const bool once = lv_dropdown_get_selected(sched_mode_dd) == 1;
+  show(sched_date_group, once);
+}
+
+void close_schedule() { show(sched_modal, false); }
+
+void save_schedule_clicked(lv_event_t *) {
+  if (!net::time_valid()) return show_toast("Connect Wi-Fi first to set the correct time");
+  const PanelRecipe *p = find(cur);
+  if (!p) return show_toast("Choose a recipe first");
+
+  brew_schedule.enabled = true;
+  brew_schedule.daily = lv_dropdown_get_selected(sched_mode_dd) == 0;
+  brew_schedule.uid = cur;
+  brew_schedule.hour = lv_roller_get_selected(sched_hour);
+  brew_schedule.minute = lv_roller_get_selected(sched_minute);
+  brew_schedule.last_day = -1;
+  brew_schedule.once_epoch = 0;
+
+  if (!brew_schedule.daily) {
+    struct tm target = {};
+    target.tm_mday = lv_roller_get_selected(sched_day) + 1;
+    target.tm_mon = lv_roller_get_selected(sched_month);
+    target.tm_year = 126 + lv_roller_get_selected(sched_year); // year options begin at 2026
+    target.tm_hour = brew_schedule.hour;
+    target.tm_min = brew_schedule.minute;
+    target.tm_sec = 0;
+    target.tm_isdst = -1;
+    const int requested_day = lv_roller_get_selected(sched_day) + 1;
+    const int requested_month = lv_roller_get_selected(sched_month);
+    const int requested_year = 2026 + lv_roller_get_selected(sched_year);
+    const time_t epoch = mktime(&target);
+    if (target.tm_mday != requested_day || target.tm_mon != requested_month ||
+        target.tm_year + 1900 != requested_year || epoch <= time(nullptr) + 30)
+      return show_toast("Choose a valid future date and time");
+    brew_schedule.once_epoch = (int64_t)epoch;
+  }
+  save_schedule();
+  close_schedule();
+  show_toast(brew_schedule.daily ? "Daily brew schedule saved" : "One-time brew schedule saved");
+}
+
+void cancel_schedule_clicked(lv_event_t *) {
+  brew_schedule.enabled = false;
+  save_schedule();
+  close_schedule();
+  show_toast("Brew schedule cancelled");
+}
+
+void open_schedule(lv_event_t *) {
+  if (scheduled_loading) return show_toast("A scheduled brew is already starting");
+  if (!find(cur)) return;
+  if (!net::time_valid()) return show_toast("Connect Wi-Fi first to set the correct time");
+  struct tm now = {};
+  net::local_time(&now);
+  int hour = now.tm_hour, minute = now.tm_min + 1;
+  if (minute >= 60) { minute = 0; hour = (hour + 1) % 24; }
+  int day = now.tm_mday - 1, month = now.tm_mon, year = now.tm_year + 1900;
+  if (brew_schedule.enabled && brew_schedule.uid == cur) {
+    hour = brew_schedule.hour;
+    minute = brew_schedule.minute;
+    if (!brew_schedule.daily && brew_schedule.once_epoch > 0) {
+      time_t e = (time_t)brew_schedule.once_epoch;
+      struct tm t = {};
+      localtime_r(&e, &t);
+      day = t.tm_mday - 1; month = t.tm_mon; year = t.tm_year + 1900;
+    }
+  }
+  lv_roller_set_selected(sched_hour, hour, LV_ANIM_OFF);
+  lv_roller_set_selected(sched_minute, minute, LV_ANIM_OFF);
+  lv_roller_set_selected(sched_day, day, LV_ANIM_OFF);
+  lv_roller_set_selected(sched_month, month, LV_ANIM_OFF);
+  lv_roller_set_selected(sched_year, year - 2026, LV_ANIM_OFF);
+  lv_dropdown_set_selected(sched_mode_dd, brew_schedule.enabled && brew_schedule.uid == cur && !brew_schedule.daily ? 1 : 0);
+  refresh_schedule_mode();
+  show(sched_modal, true);
+  lv_obj_move_foreground(sched_modal);
+}
+
+void build_schedule_modal() {
+  sched_modal = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(sched_modal);
+  lv_obj_set_size(sched_modal, W, H);
+  lv_obj_set_style_bg_color(sched_modal, hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(sched_modal, LV_OPA_70, 0);
+  lv_obj_add_flag(sched_modal, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_t *dlg = box(sched_modal, 0, 0, 660, 360, 0x1C1C1E, 24);
+  lv_obj_center(dlg);
+  lv_obj_t *title = text(dlg, "Schedule brew", &inter_26b, hex(TEXT));
+  lv_obj_set_pos(title, 24, 18);
+  lv_obj_t *mode_lbl = text(dlg, "Repeat", &inter_16, hex(SUB));
+  lv_obj_set_pos(mode_lbl, 28, 66);
+  sched_mode_dd = lv_dropdown_create(dlg);
+  lv_dropdown_set_options(sched_mode_dd, "يوميًا\nمرة واحدة");
+  lv_obj_set_size(sched_mode_dd, 132, 42);
+  lv_obj_set_pos(sched_mode_dd, 28, 92);
+  lv_obj_set_style_bg_color(sched_mode_dd, hex(0x2C2C2E), 0);
+  lv_obj_set_style_bg_opa(sched_mode_dd, LV_OPA_COVER, 0);
+  lv_obj_set_style_text_color(sched_mode_dd, hex(TEXT), 0);
+  lv_obj_set_style_text_font(sched_mode_dd, &lv_font_dejavu_16_persian_hebrew, 0);
+  lv_obj_set_style_base_dir(sched_mode_dd, LV_BASE_DIR_RTL, 0);
+  lv_obj_set_style_border_width(sched_mode_dd, 0, 0);
+  lv_obj_add_event_cb(sched_mode_dd, [](lv_event_t *) { refresh_schedule_mode(); }, LV_EVENT_VALUE_CHANGED, nullptr);
+
+  lv_obj_t *time_lbl = text(dlg, "Time (24-hour)", &inter_16, hex(SUB));
+  lv_obj_set_pos(time_lbl, 190, 66);
+  static const char *hours = "00\n01\n02\n03\n04\n05\n06\n07\n08\n09\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23";
+  static const char *minutes =
+      "00\n01\n02\n03\n04\n05\n06\n07\n08\n09\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36\n37\n38\n39\n40\n41\n42\n43\n44\n45\n46\n47\n48\n49\n50\n51\n52\n53\n54\n55\n56\n57\n58\n59";
+  sched_hour = schedule_roller(dlg, 190, 92, 68, 142, hours, 7);
+  sched_minute = schedule_roller(dlg, 268, 92, 68, 142, minutes, 0);
+
+  sched_date_group = group(dlg, 350, 60, 284, 190);
+  lv_obj_t *date_lbl = text(sched_date_group, "Date", &inter_16, hex(SUB));
+  lv_obj_set_pos(date_lbl, 0, 6);
+  static const char *days =
+      "01\n02\n03\n04\n05\n06\n07\n08\n09\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31";
+  static const char *months = "يناير\nفبراير\nمارس\nأبريل\nمايو\nيونيو\nيوليو\nأغسطس\nسبتمبر\nأكتوبر\nنوفمبر\nديسمبر";
+  static const char *years = "2026\n2027\n2028\n2029\n2030\n2031\n2032\n2033\n2034\n2035";
+  sched_day = schedule_roller(sched_date_group, 0, 34, 68, 142, days, 0);
+  sched_month = schedule_roller(sched_date_group, 76, 34, 76, 142, months, 0);
+  sched_year = schedule_roller(sched_date_group, 160, 34, 82, 142, years, 0);
+
+  lv_obj_t *cancel = pill(dlg, 28, 286, 180, 50, "Cancel schedule", 0x38383A, TEXT, cancel_schedule_clicked);
+  (void)cancel;
+  pill(dlg, 224, 286, 170, 50, "Close", 0x38383A, TEXT, [](lv_event_t *) { close_schedule(); });
+  pill(dlg, 410, 286, 220, 50, "Save schedule", 0xFFFFFF, 0x000000, save_schedule_clicked);
+  show(sched_modal, false);
+}
+
+void scheduled_start(uint32_t uid) {
+  PanelRecipe *p = find(uid);
+  if (!p || link != LinkState::Connected || flow != Flow::Idle || active || grinding || pouring) return;
+  if (const char *err = xb::validate(p->r)) {
+    show_toast(err);
+    return;
+  }
+  BleCmd c;
+  c.type = BleCmdType::Load;
+  c.recipe = p->r;
+  if (!ble_link::post(c)) return;
+  active_copy = p->r;
+  active = uid;
+  flow = Flow::Loading;
+  scheduled_loading = true;
+  scheduled_uid = uid;
+  wake_req = true;
+  if (brew_schedule.daily) {
+    struct tm now = {};
+    if (net::local_time(&now)) brew_schedule.last_day = schedule_day_key(now);
+  } else {
+    brew_schedule.enabled = false; // one-time schedule is consumed when execution is requested
+  }
+  save_schedule();
+  refresh_detail();
+}
+
+void tick_schedule() {
+  if (!brew_schedule.enabled || scheduled_loading || millis() - schedule_last_check_ms < 1000) return;
+  schedule_last_check_ms = millis();
+  struct tm now = {};
+  if (!net::local_time(&now)) return;
+  const time_t now_epoch = time(nullptr);
+  const int day_key = schedule_day_key(now);
+  if (brew_schedule.daily && brew_schedule.last_day == day_key) return;
+
+  time_t target_epoch = 0;
+  if (brew_schedule.daily) {
+    struct tm target = now;
+    target.tm_hour = brew_schedule.hour;
+    target.tm_min = brew_schedule.minute;
+    target.tm_sec = 0;
+    target.tm_isdst = -1;
+    target_epoch = mktime(&target);
+  } else {
+    target_epoch = (time_t)brew_schedule.once_epoch;
+  }
+  if (now_epoch < target_epoch) return;
+  if (now_epoch > target_epoch + 300) {
+    if (brew_schedule.daily) brew_schedule.last_day = day_key;
+    else brew_schedule.enabled = false;
+    save_schedule();
+    if (!brew_schedule.daily) show_toast("One-time schedule expired; no brew was started");
+    return;
+  }
+
+  // Do not brew unless the machine is connected, idle, and the scale has
+  // reported a cup-sized weight recently. This avoids a dry/empty scheduled run.
+  const bool cup_present = last_weight_ms && millis() - last_weight_ms < 30000 && weight_g >= 10.0f;
+  if (link != LinkState::Connected || flow != Flow::Idle || active || grinding || pouring || !cup_present) return;
+  scheduled_start(brew_schedule.uid);
+}
+
 // Detail layout: two columns under the back row.
 const int D_TOP = 92, D_LEFT_W = 360, D_RIGHT_X = M + D_LEFT_W + 24, D_RIGHT_W = W - M - D_RIGHT_X;
 const int D_HDR_H = 160, D_STATS_Y = D_TOP + D_HDR_H + 12, D_STATS_H = 84;
@@ -1253,6 +1676,10 @@ void build_detail() {
   lv_obj_center(text(eb, LV_SYMBOL_EDIT, &lv_font_montserrat_20, hex(TEXT)));
   on_click(eb, [](lv_event_t *) { open_editor(cur); });
   pressable(eb);
+  lv_obj_t *sb = group(scr_detail, W - M - 52 - 8 - 52 - 8 - 52, SB, 52, 52);
+  lv_obj_center(text(sb, LV_SYMBOL_BELL, &lv_font_montserrat_20, hex(TEXT)));
+  on_click(sb, open_schedule);
+  pressable(sb);
   lv_obj_t *hb = group(scr_detail, W - M - 52 - 8 - 52, SB, 52, 52);
   lv_obj_t *heart = heart_icon(hb, p.favorite ? 0xFF453A : 0x5A5A5E);
   lv_obj_center(heart);
@@ -2147,7 +2574,7 @@ void refresh_account() {
     const time_t ls = cloud::last_sync();
     if (ls && localtime_r(&ls, &t)) {
       int h = t.tm_hour % 12;
-      snprintf(when, sizeof when, "at %d:%02d %s", h ? h : 12, t.tm_min, t.tm_hour < 12 ? "AM" : "PM");
+      snprintf(when, sizeof when, "في %d:%02d %s", h ? h : 12, t.tm_min, tr(t.tm_hour < 12 ? "AM" : "PM"));
     }
     snprintf(buf, sizeof buf, "%d created  |  %d shared\nLast synced %s%s", mine, shared, when,
              cloud::busy() ? "  (syncing...)" : "");
@@ -2352,6 +2779,7 @@ void handle(const UiEvent &e) {
     case UiEvType::Link: set_link((LinkState)e.i, e.msg); break;
     case UiEvType::Weight:
       weight_g = e.f;
+      last_weight_ms = millis();
       if (fabsf(weight_g - wake_ref_weight) >= 2.0f) {  // cup placed or lifted
         wake_ref_weight = weight_g;
         wake_req = true;
@@ -2393,8 +2821,8 @@ void handle(const UiEvent &e) {
       const BleCmdType t = (BleCmdType)e.i;
       if (!e.ok) {
         show_toast(e.msg[0] ? e.msg : "Command failed");
-        if (t == BleCmdType::Load) brew_ended();
-        if (t == BleCmdType::Execute) flow = Flow::Loaded;
+        if (t == BleCmdType::Load) { scheduled_loading = false; brew_ended(); }
+        if (t == BleCmdType::Execute) { scheduled_loading = false; flow = Flow::Loaded; }
         if (t == BleCmdType::GrinderStart) { grinding = false; set_text(gr_play_icon, LV_SYMBOL_PLAY); }
         if (t == BleCmdType::BrewerStart) { pouring = false; set_text(br_play_icon, LV_SYMBOL_PLAY); }
         refresh_detail();
@@ -2402,7 +2830,19 @@ void handle(const UiEvent &e) {
       }
       if (t == BleCmdType::Load) {
         flow = Flow::Loaded;
-        if (lv_screen_active() == scr_detail && cur == active) show(modal, true);
+        if (scheduled_loading && active == scheduled_uid) {
+          scheduled_loading = false;
+          const bool cup_present = last_weight_ms && millis() - last_weight_ms < 30000 && weight_g >= 10.0f;
+          if (cup_present && link == LinkState::Connected) {
+            post(BleCmdType::Execute);
+            flow = Flow::Starting;
+          } else {
+            post(BleCmdType::QuitRecipe);
+            flow = Flow::Idle;
+            active = 0;
+            show_toast("Scheduled brew cancelled: no cup detected");
+          }
+        } else if (lv_screen_active() == scr_detail && cur == active) show(modal, true);
       } else if (t == BleCmdType::Execute) {
         flow = Flow::Brewing;
         water_ml = 0;
@@ -2436,6 +2876,8 @@ void begin() {
   build_update();
   build_status_bar();
   build_modal();
+  build_schedule_modal();
+  load_schedule();
   build_confirm();
   build_clock();
 
@@ -2476,6 +2918,7 @@ void tick() {
     set_text(sc_timer, buf);
     if (lv_screen_active() == scr_detail && active == cur) refresh_detail();
     update_brew_scene();
+    tick_schedule();
     check_idle_home();
     refresh_net();
     const cloud::Acct as = cloud::state();
