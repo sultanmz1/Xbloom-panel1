@@ -14,7 +14,9 @@
 #define LV_FONT_MONTSERRAT_28 1
 #define LV_FONT_MONTSERRAT_48 1
 #define LV_FONT_DEFAULT &lv_font_montserrat_16
-
+#define LV_USE_BIDI 1
+#define LV_USE_ARABIC_PERSIAN_CHARS 1
+#define LV_FONT_DEJAVU_16_PERSIAN_HEBREW 1
 #define LV_USE_PERF_MONITOR 0
 #define LV_USE_MEM_MONITOR 0
 #endif
