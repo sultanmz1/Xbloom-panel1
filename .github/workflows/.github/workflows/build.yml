@@ -1,0 +1,32 @@
+
+name: Build xBloom Firmware
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Build Firmware
+        run: pio run -e crowpanel-advance-43
+
+      - name: Upload Firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: xBloom-firmware
+          path: .pio/build/crowpanel-advance-43/
